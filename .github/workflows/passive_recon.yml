@@ -1,0 +1,718 @@
+name: Automated Parallel Passive Reconnaissance (Scatter-Gather Engine)
+
+on:
+  workflow_dispatch:
+  #schedule:
+    #- cron: '17 19 * * *'
+    #- cron: '17 7 * * *'
+
+permissions:
+  contents: write
+  actions: read 
+
+jobs:
+  # ==========================================
+  # [Job 1] Phase 1: 서브도메인 탐색 전담대 (Map)
+  # ==========================================
+  subdomain-discovery:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        group: ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: 타겟 도메인 리스트 생성
+      run: echo "${{ secrets.TARGET_DOMAINS }}" > targets.txt
+    - name: Go 환경 세팅
+      uses: actions/setup-go@v5
+      with: { go-version: 'stable' }
+    - name: Subfinder 설치
+      run: |
+        go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+        echo "$HOME/go/bin" >> $GITHUB_PATH
+    - name: 서브도메인 발굴 가동
+      run: |
+        chmod +x subdomain_enum.sh
+        ./subdomain_enum.sh ${{ matrix.group }}
+    - name: 발굴된 서브도메인 업로드
+      uses: actions/upload-artifact@v4
+      with:
+        name: subdomain-results-${{ matrix.group }}
+        path: results/discovered_subdomains_${{ matrix.group }}.txt
+        retention-days: 1
+
+  # ==========================================
+  # [Job 2] Phase 2: 서브도메인 글로벌 믹서 (Shuffle)
+  # ==========================================
+  subdomain-mixer:
+    runs-on: ubuntu-latest
+    needs: subdomain-discovery
+    steps:
+    - uses: actions/checkout@v4
+    - name: Python 환경 세팅
+      uses: actions/setup-python@v5
+      with: { python-version: '3.10' }
+    - name: 20대의 서브도메인 파편 다운로드
+      uses: actions/download-artifact@v4
+      with:
+        pattern: subdomain-results-*
+        path: results
+        merge-multiple: true
+    - name: 글로벌 믹서 가동 (균등 분할)
+      run: python subdomain_mixer.py
+    - name: 분할 탄창 업로드
+      uses: actions/upload-artifact@v4
+      with:
+        name: balanced-targets
+        path: balanced_targets/
+        retention-days: 1
+
+  # ==========================================
+  # [Job 3] Phase 3: 분산 URL 정찰 및 오프라인 분석 (Reduce)
+  # ==========================================
+  recon-node:
+    runs-on: ubuntu-latest
+    needs: subdomain-mixer
+    strategy:
+      matrix:
+        group: ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+    - name: Go 환경 세팅
+      uses: actions/setup-go@v5
+      with: { go-version: 'stable' }
+    - name: 수집 도구 풀세트 설치
+      run: |
+        go install github.com/lc/gau/v2/cmd/gau@latest
+        go install github.com/tomnomnom/waybackurls@latest
+        go install github.com/BishopFox/jsluice/cmd/jsluice@latest
+        go install github.com/projectdiscovery/katana/cmd/katana@latest
+        pip install uro
+        sudo apt-get install jq -y
+        curl -sSfL --retry 5 --retry-delay 5 "https://github.com/trufflesecurity/trufflehog/releases/download/v3.82.0/trufflehog_3.82.0_linux_amd64.tar.gz" -o trufflehog.tar.gz
+        tar -xzf trufflehog.tar.gz trufflehog 2>/dev/null || tar -xzf trufflehog.tar.gz
+        sudo mv trufflehog /usr/local/bin/
+        echo "$HOME/go/bin" >> $GITHUB_PATH
+
+    - name: 균등 분배된 타겟 다운로드 및 세팅
+      uses: actions/download-artifact@v4
+      with:
+        name: balanced-targets
+        path: balanced_targets
+    - run: cp balanced_targets/targets_${{ matrix.group }}.txt targets.txt
+
+    - name: 이전 스캔 이력 다운로드
+      uses: dawidd6/action-download-artifact@v3
+      continue-on-error: true
+      with:
+        github_token: ${{secrets.GITHUB_TOKEN}}
+        workflow: passive_recon.yml
+        name: passive-recon-master-report-secured
+        path: previous_report/
+
+    - name: 이전 다운로드 이력 복원
+      run: |
+        touch global_js_db.txt
+        if [ -f "previous_report/passive_recon_report_secured.zip" ]; then
+          cd previous_report
+          unzip -P "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" passive_recon_report_secured.zip recon_history.db || true
+          if [ -f "recon_history.db" ]; then
+            python3 -c "import sqlite3; conn=sqlite3.connect('recon_history.db'); c=conn.cursor(); c.execute('CREATE TABLE IF NOT EXISTS downloaded_js (url TEXT PRIMARY KEY)'); rows=c.execute('SELECT url FROM downloaded_js').fetchall(); f=open('../global_js_db.txt', 'w'); [f.write(r[0]+'\n') for r in rows]; f.close()"
+          fi
+          cd ..
+        fi
+
+    - name: 딥 스캔 엔진 가동
+      run: |
+        chmod +x *.sh
+        ./collect_urls.sh ${{ matrix.group }}
+        ./scan_linkfinder.sh ${{ matrix.group }}
+        ./scan_trufflehog.sh ${{ matrix.group }}
+
+    - name: 결과물 암호화
+      run: |
+        mkdir -p encrypted_final
+        tar -czf - -C results/ --exclude='*_js_files*' . 2>/dev/null | gpg --symmetric --batch --yes --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" --cipher-algo AES256 --output encrypted_final/node_results_${{ matrix.group }}.tar.gz.gpg
+
+    - name: 아티팩트 업로드
+      uses: actions/upload-artifact@v4
+      with:
+        name: node-results-${{ matrix.group }}
+        path: encrypted_final/node_results_${{ matrix.group }}.tar.gz.gpg
+        retention-days: 1
+
+  # ==========================================
+  # [Job 4] 글로벌 믹서기 1차 - 수집된 '전체' 아카이브 데이터 병합 및 정렬
+  # ==========================================
+  global-mixer:
+    runs-on: ubuntu-latest
+    needs: recon-node
+    steps:
+    - name: 저장소 체크아웃
+      uses: actions/checkout@v4
+
+    - name: Python 환경 세팅
+      uses: actions/setup-python@v5
+      with: { python-version: '3.10' }
+
+    - name: 타겟 도메인 리스트 생성
+      run: echo "${{ secrets.TARGET_DOMAINS }}" > targets.txt
+
+    - name: 모든 파편 데이터 다운로드
+      uses: actions/download-artifact@v4
+      with:
+        path: encrypted_storage
+        merge-multiple: true
+
+    - name: 파편 데이터 복호화 및 압축 해제
+      run: |
+        mkdir -p results
+        for f in encrypted_storage/*.gpg; do
+          gpg --decrypt --batch --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" "$f" 2>/dev/null | tar -xzf - -C results/
+        done
+
+    - name: 1차 셔플 엔진 가동 (모든 추출 URL 섞기)
+      run: python global_mixer.py
+
+    - name: 20분할 탄창 암호화
+      run: |
+        mkdir -p encrypted_chunks
+        tar -czf - -C chunks/ . 2>/dev/null | gpg --symmetric --batch --yes --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" --cipher-algo AES256 --output encrypted_chunks/global_chunks.tar.gz.gpg
+
+    - name: 1차 분할 탄창 업로드
+      uses: actions/upload-artifact@v4
+      with:
+        name: global-chunks
+        path: encrypted_chunks/global_chunks.tar.gz.gpg
+        retention-days: 1
+
+  # ==========================================
+  # [Job 5] Httpx 생존 검사 전담대 (20대 분산)
+  # ==========================================
+  httpx-live-probe:
+    runs-on: ubuntu-latest
+    needs: global-mixer
+    strategy:
+      matrix:
+        group: ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"]
+      fail-fast: false
+    steps:
+    - name: Httpx 및 uro 설치
+      run: |
+        go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+        pip install uro
+        echo "$HOME/go/bin" >> $GITHUB_PATH
+
+    - name: 암호화된 1차 분할 탄창 다운로드
+      uses: actions/download-artifact@v4
+      with:
+        name: global-chunks
+        path: temp_chunks
+
+    - name: 1차 분할 탄창 복호화 및 필터링
+      run: |
+        mkdir -p chunks
+        gpg --decrypt --batch --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" temp_chunks/global_chunks.tar.gz.gpg 2>/dev/null | tar -xzf - -C chunks/
+        if [ -s chunks/chunk_${{ matrix.group }}.txt ]; then
+          uro -i chunks/chunk_${{ matrix.group }}.txt -o chunks/chunk_${{ matrix.group }}.txt
+        fi
+
+    - name: 실시간 생존 여부(Httpx) 프로빙 개시
+      run: |
+        mkdir -p strike_out
+        if [ -s chunks/chunk_${{ matrix.group }}.txt ]; then
+          TOTAL=$(wc -l < chunks/chunk_${{ matrix.group }}.txt)
+          echo "🤖 [Httpx Check] 생존 유무 전수 검사 (${{ matrix.group }}) - 총 ${TOTAL}개"
+          httpx -l chunks/chunk_${{ matrix.group }}.txt -sc -td -server -random-agent -rl 10 -t 5 -timeout 5 -retries 1 -json -silent > strike_out/httpx_results_${{ matrix.group }}.json
+          
+          jq -r 'select(.status_code == 200) | .url' strike_out/httpx_results_${{ matrix.group }}.json | sort -u > temp_live.txt
+          grep -iEv "%3c|%3e|<|>|%22|\"|%20| |\*|%2a|%27|'" temp_live.txt > strike_out/clean_live_${{ matrix.group }}.txt || true
+        else
+          touch strike_out/httpx_results_${{ matrix.group }}.json
+          touch strike_out/clean_live_${{ matrix.group }}.txt
+        fi
+
+    - name: 생존 검사 결과 암호화
+      run: |
+        mkdir -p encrypted_httpx
+        tar -czf - -C strike_out/ . 2>/dev/null | gpg --symmetric --batch --yes --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" --cipher-algo AES256 --output encrypted_httpx/httpx_node_${{ matrix.group }}.tar.gz.gpg
+
+    - name: Httpx 결과 업로드
+      uses: actions/upload-artifact@v4
+      with:
+        name: httpx-results-${{ matrix.group }}
+        path: encrypted_httpx/httpx_node_${{ matrix.group }}.tar.gz.gpg
+        retention-days: 1
+
+  # ==========================================
+  # [Job 6] 글로벌 생존자 믹서기 2차 - 작업량 완벽 균등 분배
+  # ==========================================
+  live-url-mixer:
+    runs-on: ubuntu-latest
+    needs: httpx-live-probe
+    steps:
+    - name: 모든 노드의 생존 검사 결과 다운로드
+      uses: actions/download-artifact@v4
+      with:
+        pattern: httpx-results-*
+        path: encrypted_httpx
+        merge-multiple: true
+
+    - name: 복호화 및 200 OK 결과 취합
+      run: |
+        mkdir -p httpx_raw
+        for f in encrypted_httpx/*.gpg; do
+          gpg --decrypt --batch --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" "$f" 2>/dev/null | tar -xzf - -C httpx_raw/
+        done
+        
+        cat httpx_raw/clean_live_*.txt 2>/dev/null | sort -u | shuf > global_live_urls.txt
+        TOTAL_LIVE=$(wc -l < global_live_urls.txt)
+        echo "====================================================="
+        echo "✅ 최종 수집된 완벽한 200 OK 타겟: 총 ${TOTAL_LIVE} 개"
+        echo "====================================================="
+        
+        mkdir -p balanced_chunks
+        split -n l/20 -d -a 2 global_live_urls.txt balanced_chunks/live_chunk_
+
+    - name: 균등 분할 탄창 암호화 및 업로드
+      run: |
+        mkdir -p encrypted_balanced
+        tar -czf - -C balanced_chunks/ . 2>/dev/null | gpg --symmetric --batch --yes --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" --cipher-algo AES256 --output encrypted_balanced/balanced_live_chunks.tar.gz.gpg
+    - uses: actions/upload-artifact@v4
+      with:
+        name: balanced-live-chunks
+        path: encrypted_balanced/balanced_live_chunks.tar.gz.gpg
+        retention-days: 1
+
+  # ==========================================
+  # [Job 7] 스크린샷 캡처 하이브리드 부대
+  # ==========================================
+  screenshot-strike:
+    runs-on: ubuntu-latest
+    needs: live-url-mixer
+    strategy:
+      matrix:
+        group: ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"]
+      fail-fast: false
+    steps:
+    - name: Gowitness 및 필수 패키지 설치
+      run: |
+        go install github.com/sensepost/gowitness@latest
+        sudo apt-get update
+        sudo apt-get install -y sqlite3 fonts-nanum fonts-noto-cjk language-pack-ko locales
+        sudo locale-gen ko_KR.UTF-8
+        sudo update-locale LANG=ko_KR.UTF-8 LC_ALL=ko_KR.UTF-8
+        sudo fc-cache -fv
+        echo "$HOME/go/bin" >> $GITHUB_PATH
+
+    - name: 균등 분배된 생존 타겟 다운로드
+      uses: actions/download-artifact@v4
+      with:
+        name: balanced-live-chunks
+        path: temp_chunks
+
+    - name: 하이브리드 스크린샷 촬영
+      env:
+        LANG: ko_KR.UTF-8
+        LANGUAGE: ko_KR:ko
+        LC_ALL: ko_KR.UTF-8
+      run: |
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        
+        mkdir -p balanced_chunks
+        gpg --decrypt --batch --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" temp_chunks/balanced_live_chunks.tar.gz.gpg 2>/dev/null | tar -xzf - -C balanced_chunks/
+        
+        TARGET_FILE="balanced_chunks/live_chunk_${{ matrix.group }}"
+        mkdir -p strike_out
+        
+        if [ -s "$TARGET_FILE" ]; then
+          URL_COUNT=$(wc -l < "$TARGET_FILE")
+          echo "========================================================="
+          echo "🚀 [1단계] 고속 일괄 사격(Batch Mode) 개시..."
+          
+          timeout 10m gowitness scan file -f "$TARGET_FILE" --timeout 15 --delay 3 2>&1 | tee -a gowitness_console_${{ matrix.group }}.log | grep -viE "error|fail|timeout|canceled|deadline|refused|blocked|killed|panic|sigsegv|warn" || true
+          
+          sqlite3 gowitness.sqlite3 "SELECT url FROM urls WHERE screenshot_path IS NOT NULL;" > success_urls.txt 2>/dev/null || touch success_urls.txt
+          
+          awk 'NR==FNR{a[$0];next} !($0 in a)' success_urls.txt "$TARGET_FILE" > missing_urls.txt
+          MISSING_COUNT=$(wc -l < missing_urls.txt)
+          
+          if [ "$MISSING_COUNT" -gt 0 ]; then
+            echo "⚠️ 누락된 $MISSING_COUNT 개 타겟에 대해 [2단계] 정밀 단발 사격 개시..."
+            cat missing_urls.txt | xargs -n 1 -P 3 -I {} sh -c '
+              timeout 25s gowitness scan single -u "{}" --timeout 15 --delay 3 >> gowitness_fallback_${{ matrix.group }}.log 2>&1 || true
+            '
+            cat gowitness_fallback_${{ matrix.group }}.log >> gowitness_console_${{ matrix.group }}.log 2>/dev/null || true
+          fi
+          
+          grep -iE "error|failed|timeout|canceled|context deadline|refused|blocked|killed|panic|SIGSEGV" gowitness_console_${{ matrix.group }}.log > screenshot_errors_${{ matrix.group }}.txt || true
+          sqlite3 gowitness.sqlite3 -header -csv "SELECT url, response_code, response_reason, title FROM urls WHERE screenshot_path IS NULL OR response_reason != '';" > gowitness_failures_${{ matrix.group }}.csv 2>/dev/null || true
+          
+          if [ -d "screenshots" ]; then
+            mv screenshots strike_out/
+          fi
+          
+          mv gowitness_console_${{ matrix.group }}.log strike_out/ 2>/dev/null || true
+          mv screenshot_errors_${{ matrix.group }}.txt strike_out/ 2>/dev/null || true
+          mv gowitness_failures_${{ matrix.group }}.csv strike_out/ 2>/dev/null || true
+          mv missing_urls.txt strike_out/missing_urls_${{ matrix.group }}.txt 2>/dev/null || true
+        fi
+
+    - name: 캡처 결과 암호화 및 업로드
+      run: |
+        mkdir -p encrypted_strike
+        tar -czf - -C strike_out/ . 2>/dev/null | gpg --symmetric --batch --yes --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" --cipher-algo AES256 --output encrypted_strike/strike_results_${{ matrix.group }}.tar.gz.gpg
+    - uses: actions/upload-artifact@v4
+      with:
+        name: strike-results-${{ matrix.group }}
+        path: encrypted_strike/strike_results_${{ matrix.group }}.tar.gz.gpg
+        retention-days: 1
+
+  # ==========================================
+  # [Job 8] 생존 분석 기반 컬러 대시보드 및 통합 갤러리 사출
+  # ==========================================
+  excel-reporter:
+    runs-on: ubuntu-latest
+    needs: [recon-node, httpx-live-probe, screenshot-strike]
+    steps:
+    - name: 저장소 체크아웃
+      uses: actions/checkout@v4
+
+    - name: Python 환경 세팅
+      uses: actions/setup-python@v5
+      with: { python-version: '3.10' }
+
+    - name: Python 라이브러리 설치
+      run: pip install openpyxl requests aiohttp duckduckgo-search
+
+    - name: 타겟 도메인 리스트 생성
+      run: echo "${{ secrets.TARGET_DOMAINS }}" > targets.txt
+
+    - name: 1. 파편 데이터(Job 3) 다운로드
+      uses: actions/download-artifact@v4
+      with: { pattern: node-results-*, path: encrypted_storage, merge-multiple: true }
+
+    - name: 2. Httpx 로그(Job 5) 다운로드 (갤러리 매핑용)
+      uses: actions/download-artifact@v4
+      with: { pattern: httpx-results-*, path: encrypted_storage, merge-multiple: true }
+
+    - name: 3. 스크린샷 데이터(Job 7) 다운로드
+      uses: actions/download-artifact@v4
+      with: { pattern: strike-results-*, path: encrypted_storage, merge-multiple: true }
+
+    - name: 취합 데이터 일괄 복호화
+      run: |
+        mkdir -p results
+        for f in encrypted_storage/*.gpg; do
+          gpg --decrypt --batch --passphrase "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" "$f" 2>/dev/null | tar -xzf - -C results/
+        done
+
+    - name: 📸 세로형 대시보드 및 모바일 Base64 내장형 갤러리 조립
+      run: |
+        mkdir -p reports/screenshot_report/images
+        
+        if [ -d "results/screenshots" ]; then
+          cp results/screenshots/* reports/screenshot_report/images/ 2>/dev/null || true
+        fi
+        
+        cat << 'EOF' > generate_gallery.py
+        import os, urllib.parse, hashlib, json, glob, base64, mimetypes, re
+        from collections import defaultdict
+        
+        img_dir = 'reports/screenshot_report/images'
+        html_path = 'reports/screenshot_report/index.html'
+        
+        url_mapping = {}
+        
+        def add_to_mapping(url):
+            if not url: return
+            url_stripped = url.rstrip("/")
+            safe_name = url_stripped.replace("://", "---").replace(":", "-").replace("/", "-").replace("?", "-").replace("=", "-").replace("&", "-")
+            url_mapping[safe_name] = url
+
+        # 1. Httpx 결과에서 URL 추출
+        for json_file in glob.glob('results/httpx_results_*.json'):
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip(): continue
+                        try:
+                            data = json.loads(line)
+                            if data.get('status_code') == 200:
+                                add_to_mapping(data.get('url', ''))
+                        except Exception: pass
+            except Exception: pass
+
+        # 2. 리다이렉트된 최종 URL을 Gowitness 로그에서 직접 긁어와서 사전(mapping) 보강
+        for log_file in glob.glob('results/gowitness_console_*.log'):
+            try:
+                with open(log_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    urls = re.findall(r'url="?(https?://[^"\s]+)"?', content)
+                    for u in urls:
+                        add_to_mapping(u)
+            except Exception: pass
+                
+        domain_groups = defaultdict(list)
+        seen_hashes = set()
+        removed_count = 0
+        
+        if os.path.exists(img_dir):
+            valid_exts = ('.png', '.jpeg', '.jpg')
+            for img in sorted(os.listdir(img_dir)):
+                if img.lower().endswith(valid_exts):
+                    filepath = os.path.join(img_dir, img)
+                    try:
+                        with open(filepath, 'rb') as f:
+                            file_hash = hashlib.md5(f.read()).hexdigest()
+                    except Exception: continue
+                        
+                    if file_hash in seen_hashes:
+                        try:
+                            os.remove(filepath)
+                            removed_count += 1
+                        except OSError: pass
+                        continue
+                        
+                    seen_hashes.add(file_hash)
+                    
+                    display_name = img.rsplit('.', 1)[0]
+                    img_url = urllib.parse.quote(img)
+                    
+                    target_url = url_mapping.get(display_name)
+                    
+                    # 3. 매핑 실패 시 스마트 복원
+                    if not target_url:
+                        if "---" in display_name:
+                            scheme_rest = display_name.split("---", 1)
+                            if len(scheme_rest) == 2:
+                                rest = scheme_rest[1]
+                                match = re.match(r'^([a-zA-Z0-9.-]+?)(?:-(\d{2,5}))?-(.*)$', rest)
+                                if match and ('.' in match.group(1)):
+                                    domain = match.group(1)
+                                    port = match.group(2)
+                                    path = match.group(3).replace("-", "/")
+                                    if port:
+                                        target_url = f"{scheme_rest[0]}://{domain}:{port}/{path}"
+                                    else:
+                                        target_url = f"{scheme_rest[0]}://{domain}/{path}"
+                                else:
+                                    target_url = f"{scheme_rest[0]}://" + rest.replace("-", "/")
+                        if not target_url:
+                            target_url = f"images/{img_url}"
+                            
+                    mime_type, _ = mimetypes.guess_type(filepath)
+                    if not mime_type: mime_type = "image/png"
+                    
+                    try:
+                        with open(filepath, 'rb') as img_f:
+                            b64_data = base64.b64encode(img_f.read()).decode('utf-8')
+                        base64_src = f"data:{mime_type};base64,{b64_data}"
+                    except Exception:
+                        base64_src = f"images/{img_url}"
+                    
+                    try:
+                        if '---' in display_name: domain = display_name.split('---')[1].split('-')[0]
+                        else: domain = "기타 (Unknown)"
+                    except Exception: domain = "기타 (Unknown)"
+                        
+                    domain_groups[domain].append((img, display_name, base64_src, target_url))
+        
+        # HTML 뼈대 구성
+        html_content = f"""<!DOCTYPE html>
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>📸 Passive Recon - Screenshot Gallery</title>
+            <style>
+                body {{ font-family: 'Segoe UI', sans-serif; background-color: #f3f4f6; padding: 20px; margin: 0; scroll-behavior: smooth; }}
+                .header {{ text-align: center; margin-bottom: 40px; background: #2F3542; color: white; padding: 25px; border-radius: 12px; }}
+                
+                .dashboard {{ display: flex; flex-direction: column; gap: 12px; margin-bottom: 50px; max-width: 800px; margin-left: auto; margin-right: auto; }}
+                .dash-card {{ display: flex; justify-content: space-between; align-items: center; background: linear-gradient(135deg, #3742fa 0%, #5352ed 100%); color: white; padding: 15px 25px; border-radius: 10px; text-decoration: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); transition: 0.3s; }}
+                .dash-card:hover {{ transform: translateY(-3px); box-shadow: 0 8px 15px rgba(0,0,0,0.2); filter: brightness(1.1); }}
+                .dash-card h3 {{ margin: 0; font-size: 18px; word-break: break-all; text-align: left; flex: 1; }}
+                .dash-card span {{ font-size: 18px; font-weight: bold; background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px; white-space: nowrap; margin-left: 15px; }}
+                
+                .domain-section {{ margin-bottom: 50px; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
+                .domain-title {{ border-bottom: 3px solid #3742fa; padding-bottom: 12px; margin-top: 0; margin-bottom: 25px; color: #2f3542; font-size: 24px; display: flex; justify-content: space-between; flex-wrap: wrap; }}
+                .domain-count {{ font-size: 16px; color: #747d8c; background: #f1f2f6; padding: 5px 12px; border-radius: 20px; margin-top: 5px; }}
+                .gallery {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }}
+                .card {{ background: #ffffff; border: 1px solid #dfe4ea; border-radius: 8px; overflow: hidden; }}
+                .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,0.1); border-color: #3742fa; }}
+                
+                .card img {{ width: 100%; height: 200px; object-fit: contain; background-color: #f8f9fa; border-bottom: 1px solid #f1f2f6; cursor: zoom-in; transition: 0.3s; }}
+                .card img:hover {{ opacity: 0.8; }}
+                
+                .card .info {{ padding: 15px; font-size: 13px; word-break: break-all; text-align: center; }}
+                .card .info .main-link {{ color: #1e90ff; text-decoration: none; font-weight: 600; display: block; margin-bottom: 8px; }}
+                
+                .modal {{ display: none; position: fixed; z-index: 9999; padding-top: 50px; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.95); }}
+                .modal-content {{ margin: auto; display: block; max-width: 90%; max-height: 80vh; object-fit: contain; border-radius: 5px; }}
+                #caption {{ margin: auto; display: block; width: 80%; max-width: 700px; text-align: center; color: #fff; padding: 15px 0; font-size: 16px; word-break: break-all; }}
+                
+                .close-btn {{ position: absolute; top: 15px; right: 25px; color: #f1f1f1; font-size: 40px; font-weight: bold; transition: 0.3s; cursor: pointer; }}
+                .close-btn:hover, .close-btn:focus {{ color: #bbb; text-decoration: none; cursor: pointer; }}
+                
+                .modal-nav {{ cursor: pointer; position: absolute; top: 50%; width: auto; padding: 16px; margin-top: -50px; color: white; font-weight: bold; font-size: 30px; transition: 0.3s; user-select: none; border-radius: 5px; text-decoration: none; background-color: rgba(0,0,0,0.5); }}
+                .modal-nav.prev {{ left: 10px; }}
+                .modal-nav.next {{ right: 10px; }}
+                .modal-nav:hover {{ background-color: rgba(255, 255, 255, 0.3); color: #fff; }}
+                
+                @media (max-width: 600px) {{
+                    .gallery {{ grid-template-columns: 1fr; }}
+                    .modal-nav {{ font-size: 20px; padding: 10px; }}
+                    .dash-card {{ padding: 15px; }}
+                    .dash-card h3, .dash-card span {{ font-size: 15px; }}
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1 style="margin:0 0 10px 0;">📸 도메인별 통합 스크린샷 갤러리</h1>
+                {f'<p style="color:#ffdd59; font-weight:bold;">🧹 중복 이미지 {removed_count}장 제거됨</p>' if removed_count > 0 else ''}
+            </div>"""
+
+        # 상단 세로형 요약 대시보드 조립
+        html_content += '<div class="dashboard">'
+        for domain in sorted(domain_groups.keys()):
+            domain_id = domain.replace(".", "-")
+            count = len(domain_groups[domain])
+            html_content += f'<a href="#{domain_id}" class="dash-card" title="{domain} 섹션으로 이동"><h3>🌐 {domain}</h3><span>{count}장</span></a>'
+        html_content += '</div>'
+        
+        js_image_data = []
+        js_caption_data = []
+        global_img_idx = 0
+        
+        for domain in sorted(domain_groups.keys()):
+            domain_id = domain.replace(".", "-")
+            html_content += f'<div id="{domain_id}" class="domain-section"><h2 class="domain-title"><span>🌐 {domain}</span><span class="domain-count">총 {len(domain_groups[domain])}개</span></h2><div class="gallery">'
+            for img, display_name, base64_src, target_url in domain_groups[domain]:
+                
+                js_image_data.append(base64_src)
+                js_caption_data.append(display_name)
+                
+                html_content += f'''
+                <div class="card">
+                    <img src="{base64_src}" loading="lazy" onclick="openModal({global_img_idx})" title="클릭하여 확대보기">
+                    <div class="info">
+                        <a href="{target_url}" class="main-link" target="_blank" title="실제 웹사이트 열기">{display_name}</a>
+                    </div>
+                </div>'''
+                global_img_idx += 1
+            html_content += "</div></div>"
+            
+        html_content += '''
+            <!-- 전체 화면 모달(팝업) 영역 -->
+            <div id="imageModal" class="modal">
+                <span class="close-btn" onclick="closeModal()">&times;</span>
+                <a class="modal-nav prev" onclick="changeImage(-1)">&#10094;</a>
+                <a class="modal-nav next" onclick="changeImage(1)">&#10095;</a>
+                <img class="modal-content" id="fullImage">
+                <div id="caption"></div>
+            </div>
+
+            <script>
+                const imageData = ''' + json.dumps(js_image_data) + ''';
+                const captionData = ''' + json.dumps(js_caption_data) + ''';
+                
+                let currentIndex = 0;
+                const totalImages = imageData.length;
+
+                function openModal(index) {
+                    if (totalImages === 0) return;
+                    currentIndex = index;
+                    updateModal();
+                    document.getElementById('imageModal').style.display = 'block';
+                }
+
+                function closeModal() {
+                    document.getElementById('imageModal').style.display = 'none';
+                    document.getElementById('fullImage').src = ""; 
+                }
+                
+                function changeImage(step) {
+                    if (totalImages === 0) return;
+                    currentIndex += step;
+                    
+                    if (currentIndex >= totalImages) {
+                        currentIndex = 0;
+                    } else if (currentIndex < 0) {
+                        currentIndex = totalImages - 1;
+                    }
+                    updateModal();
+                }
+
+                function updateModal() {
+                    document.getElementById('fullImage').src = imageData[currentIndex];
+                    document.getElementById('caption').innerText = captionData[currentIndex];
+                }
+                
+                document.getElementById('imageModal').addEventListener('click', function(e) {
+                    if (e.target === this) {
+                        closeModal();
+                    }
+                });
+
+                document.addEventListener('keydown', function(event) {
+                    if (document.getElementById('imageModal').style.display === 'block') {
+                        if (event.key === "Escape") {
+                            closeModal();
+                        } else if (event.key === "ArrowLeft") {
+                            changeImage(-1);
+                        } else if (event.key === "ArrowRight") {
+                            changeImage(1);
+                        }
+                    }
+                });
+            </script>
+        </body>
+        </html>
+        '''
+        
+        with open(html_path, 'w', encoding='utf-8') as f: f.write(html_content)
+        EOF
+        
+        python3 generate_gallery.py
+
+    - name: 이전 리포트 다운로드 및 해제
+      uses: dawidd6/action-download-artifact@v3
+      continue-on-error: true
+      with:
+        github_token: ${{secrets.GITHUB_TOKEN}}
+        workflow: passive_recon.yml
+        name: passive-recon-master-report-secured
+        path: previous_report/
+    - run: cd previous_report && unzip -P "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" passive_recon_report_secured.zip || true
+
+    - name: 지능형 컬러 엑셀 리포트 제작
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      run: python -u txt_to_excel.py
+
+    - name: 🗂️ 에러 로그 취합 및 최종 리포트 금고 봉인
+      run: |
+        mkdir -p reports/logs
+        cp results/gowitness_console_*.log reports/logs/ 2>/dev/null || true
+        cp results/screenshot_errors_*.txt reports/logs/ 2>/dev/null || true
+        cp results/gowitness_failures_*.csv reports/logs/ 2>/dev/null || true
+        cp results/missing_urls_*.txt reports/logs/ 2>/dev/null || true
+        
+        cd reports
+        zip -r -P "${{ secrets.ACTIONS_CRYPTO_PASSWORD }}" passive_recon_report_secured.zip passive_recon_report_*.xlsx recon_history.db postman_collection_*.json bounty_seed.jsonl new_subdomains.txt screenshot_report/ logs/ || true
+
+    - name: 깃허브 아티팩트에 저장
+      uses: actions/upload-artifact@v4
+      with:
+        name: passive-recon-master-report-secured
+        path: reports/passive_recon_report_secured.zip
+        retention-days: 14
+
+    - name: 디스코드 배송
+      env:
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      run: python upload_to_discord.py || true

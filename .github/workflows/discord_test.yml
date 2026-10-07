@@ -1,0 +1,45 @@
+name: ⚡ Excel & Discord Quick Test (10s)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install Dependencies
+      run: pip install openpyxl requests
+
+    - name: Create Mock Data for Testing
+      run: |
+        echo "target-site.com" > targets.txt
+        mkdir -p results
+        echo "https://target-site.com/api/v1/user" > results/mock_gau.txt
+        echo "https://target-site.com/assets/main.js" > results/mock_waybackurls.txt
+
+    - name: Test Excel Builder
+      run: python txt_to_excel.py
+
+    - name: Store Test Excel in GitHub Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-quick-report
+        path: reports/passive_recon_report_v1.xlsx
+        retention-days: 3
+
+    - name: Alert Discord with Test Download Link
+      env:
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      run: |
+        curl -H "Content-Type: application/json" \
+             -X POST \
+             -d '{"content": "⚡ **[배관 작동 테스트 성공]**\n인프라 고속 사출 엔진이 정상 구동되었습니다.\n\n👇 **[테스트 보고서 다운로드 페이지 바로가기]**\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+             $DISCORD_WEBHOOK_URL

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.bounty-work*/
+*.har
+config.local.json
+inventory.json
+reports/
+demo-output/

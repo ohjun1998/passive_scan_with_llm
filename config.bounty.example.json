@@ -1,0 +1,29 @@
+{
+  "origins": ["https://app.example.com"],
+  "allow_private": false,
+  "allowed_methods": ["GET", "HEAD"],
+  "max_requests": 200,
+  "max_ai_calls": 12,
+  "max_groups": 30,
+  "rounds": 2,
+  "max_plans_per_group": 3,
+  "samples_per_group": 5,
+  "requests_per_second": 1,
+  "request_timeout": 10,
+  "evidence_ttl_seconds": 900,
+  "sessions": {
+    "anonymous": {"origins": [], "headers_env": {}},
+    "user_a": {
+      "origins": ["https://app.example.com"],
+      "headers_env": {"Cookie": "BOUNTY_COOKIE_A"},
+      "health": {"url": "https://app.example.com/api/me", "json_pointer": "/id", "equals": "user-a"}
+    },
+    "user_b": {
+      "origins": ["https://app.example.com"],
+      "headers_env": {"Cookie": "BOUNTY_COOKIE_B"},
+      "health": {"url": "https://app.example.com/api/me", "json_pointer": "/id", "equals": "user-b"}
+    }
+  },
+  "policies": [],
+  "codex": {"executable": "codex", "model": "", "reasoning_effort": "low", "timeout": 180}
+}
