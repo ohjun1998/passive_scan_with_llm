@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import asdict
 
 from .data import Redactor, Request, digest, origin
+from .console import configure_console
 from .planner import validate_plan
 from .runtime import BudgetExceeded, Transport, mutate, pointer
 
@@ -268,6 +269,7 @@ class Engine:
         return context
 
     def run(self):
+        configure_console()
         groups = defaultdict(list)
         for req in self.requests.values():
             groups[req.group].append(req)

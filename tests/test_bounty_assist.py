@@ -223,7 +223,7 @@ class EngineTests(unittest.TestCase):
             engine.execute(malicious)
             path = Path(self.temp.name) / "report.html"
             render(engine, path)
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             self.assertNotIn(malicious["hypothesis"], text)
             self.assertIn("&lt;script&gt;", text)
             self.assertNotIn("sid=lab-user-a", text)

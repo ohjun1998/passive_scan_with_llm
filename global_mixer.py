@@ -7,6 +7,7 @@ import posixpath
 from urllib.parse import urlparse, parse_qsl
 from bounty_assist.data import path_template
 from bounty_assist.seed import write_seed
+from bounty_assist.console import configure_console
 
 def make_absolute(url, domain):
     if url.startswith('http://') or url.startswith('https://'): return url
@@ -21,6 +22,7 @@ def normalize_dynamic_path(path):
     return path_template(path)
 
 def run_mixer():
+    configure_console()
     print("[+] 글로벌 셔플 엔진 가동 (과거 DB 통합 및 Httpx 재검증 준비)...")
     if not os.path.exists('targets.txt'): return
     

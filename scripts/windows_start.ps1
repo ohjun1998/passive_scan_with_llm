@@ -7,6 +7,7 @@ param(
     [switch]$Login
 )
 $ErrorActionPreference = 'Stop'
+$env:PYTHONUTF8 = '1'
 Set-Location (Split-Path $PSScriptRoot -Parent)
 function Invoke-Checked {
     param([string]$Program, [string[]]$Arguments)

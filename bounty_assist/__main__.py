@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from .data import Redactor, import_records
+from .console import configure_console
 from .engine import Engine
 from .planner import CodexPlanner, DemoPlanner
 from .report import render
@@ -12,6 +13,7 @@ from .store import Store, private_json
 
 
 def main(argv=None):
+    configure_console()
     parser = argparse.ArgumentParser(description="passive-scan URL/HAR → Plus Codex → local evidence verification")
     parser.add_argument("--workspace", default=".bounty-work", help="Private local state; reuse to resume")
     sub = parser.add_subparsers(dest="command", required=True)

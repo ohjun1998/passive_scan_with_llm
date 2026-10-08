@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import subprocess
 import tempfile
@@ -7,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bounty_assist.__main__ import main
+from bounty_assist.console import configure_console
 from bounty_assist.data import Request
 from bounty_assist.engine import Engine
 from bounty_assist.planner import CodexPlanner
@@ -16,6 +18,15 @@ from lab import config_for, lab
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_korean_console_output_is_safe_under_windows_legacy_encoding(self):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding='cp1252')
+        with patch('sys.stdout', stream):
+            configure_console()
+            print('한국어 진단 결과', flush=True)
+        self.assertEqual(raw.getvalue().decode('utf-8').strip(), '한국어 진단 결과')
+        stream.detach()
+
     def test_windows_npm_shim_uses_node_without_shell_and_unicode(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
