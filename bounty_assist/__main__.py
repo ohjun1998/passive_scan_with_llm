@@ -28,9 +28,57 @@ def main(argv=None):
     report = sub.add_parser("report", help="Regenerate masked report without sending requests")
     report.add_argument("--config", required=True)
     report.add_argument("--output", default="reports/bounty_report.html")
+    doctor = sub.add_parser("doctor", help="Check CLI/login; --live makes one model call without target traffic")
+    doctor.add_argument("--config")
+    doctor.add_argument("--live", action="store_true")
+    doctor.add_argument("--codex-executable", default="codex")
+    usage = sub.add_parser("usage", help="Show cumulative local budgets, without network")
+    usage.add_argument("--acknowledge-unknown", action="store_true",
+                       help="Acknowledge unmetered calls after checking account usage; never resets known tokens")
     args = parser.parse_args(argv)
     store = Store(args.workspace)
     try:
+        if args.command == "usage":
+            unknown = store.count("model_usage_unknown_calls")
+            if args.acknowledge_unknown:
+                store.increment("model_usage_acknowledged_calls", unknown - store.count("model_usage_acknowledged_calls"))
+            print(json.dumps({name: store.count(name) for name in (
+                "http_requests", "ai_calls", "model_tokens", "model_input_tokens", "model_output_tokens",
+                "model_usage_unknown_calls", "model_usage_acknowledged_calls")}, ensure_ascii=False))
+            return 0
+        if args.command == "doctor":
+            data = json.loads(Path(args.config).read_text(encoding="utf-8-sig")) if args.config else {"origins": ["https://example.com"]}
+            if args.codex_executable != "codex":
+                data.setdefault("codex", {})["executable"] = args.codex_executable
+            config = Config(data)
+            planner = CodexPlanner(config)
+            planner.check_capabilities()
+            print("[+] CLI 옵션·ChatGPT 로그인 확인 완료. 검사 대상 HTTP 요청 없음.", flush=True)
+            if args.live:
+                if store.count("model_usage_unknown_calls") > store.count("model_usage_acknowledged_calls"):
+                    raise RuntimeError("Codex usage is unknown; check usage and acknowledge before retrying")
+                if store.count("model_tokens") >= config.data["max_model_tokens"] or not store.reserve("ai_calls", config.data["max_ai_calls"]):
+                    raise RuntimeError("Codex local budget exhausted")
+                import time
+                key = "doctor-" + str(time.time_ns())
+                store.call(key, "started", {"status": "started", "mode": "doctor", "is_live": True, "recorded_at": time.time()})
+                try:
+                    answer, tokens = planner.plan({"requests": [], "sessions": [{"name": "anonymous", "has_identity_check": False}],
+                                                  "policies": [], "previous_results": [],
+                                                  "instruction": "No requests exist. Return an empty plans array and notes=MODEL_CALL_OK."})
+                except Exception:
+                    store.increment("model_usage_unknown_calls", 1)
+                    store.call(key, "failed", {"status": "failed", "mode": "doctor", "recorded_at": time.time()})
+                    raise
+                # Count real usage, including failed schema validation after a successful call.
+                store.record_model_usage(tokens, live=True)
+                valid = not answer["plans"]
+                store.call(key, "completed" if valid else "failed", {"status": "completed" if valid else "failed", "mode": "doctor", "usage": tokens,
+                                               "answer": {"notes": "MODEL_CALL_OK", "plans": []}, "recorded_at": time.time()})
+                if not valid:
+                    raise RuntimeError("Codex live check returned unexpected plans; rejected")
+                print(json.dumps({"live_model_success": True, "marker": "MODEL_CALL_OK", "usage": tokens}, ensure_ascii=False))
+            return 0
         if args.command == "import":
             before = len(store.requests())
             for path in args.paths:
@@ -43,7 +91,7 @@ def main(argv=None):
             private_json(args.output, records)
             print(f"[+] 요청 {len(records)}개: {args.output}")
         else:
-            config = Config(json.loads(Path(args.config).read_text(encoding="utf-8")))
+            config = Config(json.loads(Path(args.config).read_text(encoding="utf-8-sig")))
             planner = None
             if args.command == "run":
                 if args.planner == "codex":

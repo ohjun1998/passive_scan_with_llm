@@ -41,6 +41,14 @@ class Store:
         if not row:
             self.db.execute("INSERT INTO settings VALUES ('salt',?)", (self.salt.hex(),))
             self.db.commit()
+        # A workspace supports one process at a time. Recover abandoned calls.
+        interrupted = list(self.db.execute("SELECT id,data FROM calls WHERE status='started'"))
+        for key, raw in interrupted:
+            data = json.loads(raw)
+            data["status"] = "interrupted"
+            self.call(key, "interrupted", data)
+            if data.get("is_live", True):
+                self.increment("model_usage_unknown_calls", 1)
 
     def add(self, req, captured=None):
         self.db.execute("INSERT OR IGNORE INTO requests VALUES (?,?)", (req.id, json.dumps(asdict(req))))
@@ -81,6 +89,27 @@ class Store:
             self.db.execute("INSERT OR IGNORE INTO counters VALUES (?,0)", (name,))
             changed = self.db.execute("UPDATE counters SET value=value+1 WHERE name=? AND value<?", (name, limit)).rowcount
         return bool(changed)
+
+    def increment(self, name, amount):
+        if type(amount) is not int or amount < 0:
+            raise ValueError("Counter increment must be a nonnegative integer")
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO counters VALUES (?,0)", (name,))
+            self.db.execute("UPDATE counters SET value=value+? WHERE name=?", (amount, name))
+
+    def record_model_usage(self, usage, live=False):
+        keys = ("input_tokens", "output_tokens")
+        if not all(type(usage.get(k)) is int and usage[k] >= 0 for k in keys):
+            if live:
+                self.increment("model_usage_unknown_calls", 1)
+            return
+        for key in keys:
+            self.increment("model_" + key, usage[key])
+        for key in ("cached_input_tokens", "reasoning_output_tokens"):
+            if type(usage.get(key)) is int and usage[key] >= 0:
+                self.increment("model_" + key, usage[key])
+        # Cached input is included in input; reasoning is included in output.
+        self.increment("model_tokens", sum(usage[k] for k in keys))
 
     def call(self, key, status, data):
         self.db.execute("INSERT OR REPLACE INTO calls VALUES (?,?,?)", (key, status, json.dumps(data)))

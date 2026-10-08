@@ -66,12 +66,21 @@ UNTRUSTED_DATA_JSON:\n"""
 
 class CodexPlanner:
     """Official CLI bridge. No browser cookie scraping or private API requests."""
+    is_live = True
     def __init__(self, config):
         self.config = config
         executable = config.codex["executable"]
         self.executable = shutil.which(executable)
         if not self.executable:
             raise RuntimeError("Codex CLI is not installed; install it and run codex login")
+        self.command = [self.executable]
+        # Execute the npm entry point through Node, never a Windows shell/shim.
+        if Path(self.executable).suffix.lower() in (".cmd", ".bat", ".ps1"):
+            entry = Path(self.executable).parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+            node = shutil.which("node")
+            if not node or not entry.is_file():
+                raise RuntimeError("Codex Windows npm entry point missing; reinstall with npm.cmd install -g @openai/codex")
+            self.command = [node, str(entry)]
         self.env = dict(os.environ)
         # Prevent accidental API billing and keep assessment session secrets out of Codex.
         for name in ("OPENAI_API_KEY", "CODEX_API_KEY"):
@@ -80,12 +89,29 @@ class CodexPlanner:
             for name in session.get("headers_env", {}).values():
                 self.env.pop(name, None)
         try:
-            status = subprocess.run([self.executable, "login", "status"], env=self.env,
-                                    capture_output=True, text=True, timeout=20)
+            status = subprocess.run(self.command + ["login", "status"], env=self.env,
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("Codex login status timed out; check CLI installation") from exc
         if status.returncode or "chatgpt" not in (status.stdout + status.stderr).lower():
             raise RuntimeError("ChatGPT subscription login required; run codex login (API-key mode rejected)")
+
+    def check_capabilities(self):
+        try:
+            result = subprocess.run(self.command + ["exec", "--help"], env=self.env,
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Codex CLI option check timed out; check installation") from exc
+        required = ("--ignore-user-config", "--output-schema", "--ephemeral", "--json")
+        if result.returncode or any(flag not in result.stdout for flag in required):
+            raise RuntimeError("Codex CLI options unsupported; update with npm install -g @openai/codex")
+
+    def effort(self, context):
+        signals = {"auth_candidate", "differential_signal"}
+        needs_review = any(r.get("state") in signals for r in context.get("previous_results", []))
+        if self.config.codex["adaptive_reasoning"] and needs_review:
+            return self.config.codex["review_effort"]
+        return self.config.codex["reasoning_effort"]
 
     def plan(self, context):
         with tempfile.TemporaryDirectory(prefix="passive-scan-planner-") as directory:
@@ -93,22 +119,27 @@ class CodexPlanner:
             schema = root / "schema.json"
             output = root / "plan.json"
             schema.write_text(json.dumps(SCHEMA), encoding="utf-8")
-            command = [self.executable, "exec", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
+            command = self.command + ["exec", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
                        "--sandbox", "read-only", "--json", "--output-schema", str(schema), "-o", str(output),
                        "-c", 'features.shell_tool=false', "-c", 'features.unified_exec=false',
                        "-c", 'features.skill_mcp_dependency_install=false', "-c", 'web_search="disabled"',
-                       "-c", 'mcp_servers={}', "-c", 'model_reasoning_effort=' + json.dumps(self.config.codex["reasoning_effort"])]
+                       "-c", 'mcp_servers={}', "-c", 'model_reasoning_effort=' + json.dumps(self.effort(context))]
             if self.config.codex["model"]:
                 command += ["--model", self.config.codex["model"]]
             command += ["-"]
             try:
                 result = subprocess.run(command, input=make_prompt(context, self.config.data["max_plans_per_group"]),
-                                        cwd=root, env=self.env, capture_output=True, text=True,
+                                        cwd=root, env=self.env, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                         timeout=self.config.codex["timeout"])
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("Codex timed out; progress saved; retry with the same workspace") from exc
             if result.returncode or not output.exists():
                 # Never expose arbitrary CLI stderr (may include input/credentials).
+                diagnostic = (result.stdout + result.stderr).lower()
+                if "blocked by policy" in diagnostic:
+                    raise RuntimeError("Codex network access blocked by environment policy; run on your own PC")
+                if "401" in diagnostic or "unauthorized" in diagnostic:
+                    raise RuntimeError("Codex authentication rejected; run codex login on this PC again")
                 raise RuntimeError(f"Codex failed (exit {result.returncode}); check login, quota, CLI version and model support")
             usage = {}
             for line in result.stdout.splitlines():

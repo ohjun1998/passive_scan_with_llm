@@ -48,7 +48,10 @@ class Engine:
         self.requests = {r.id: r for r in store.requests()}
         self.transport = Transport(config, store)
         self.redactor = Redactor(store.salt, config.secret_values())
-        self.context_key = digest([config.data, self.redactor.obj(config.headers)])
+        # Raising operational budgets must not discard valid evidence/checkpoints.
+        evidence_config = {k: v for k, v in config.data.items()
+                           if k not in ("max_requests", "max_ai_calls", "max_groups", "max_model_tokens")}
+        self.context_key = digest([evidence_config, self.redactor.obj(config.headers)])
         self.policies = self.resolve_policies()
 
     def find_request(self, url, session=None):
@@ -217,7 +220,7 @@ class Engine:
         output["session"] = plan["session"]
         return output
 
-    def context(self, group):
+    def representatives(self, group):
         # Preserve representatives across accounts and owners before filling the sample cap.
         reps, seen = [], set()
         cap = self.config.data["samples_per_group"]
@@ -230,6 +233,10 @@ class Engine:
             if req not in reps and len(reps) < cap:
                 reps.append(req)
         reps = reps[:cap]
+        return reps
+
+    def context(self, group):
+        reps = self.representatives(group)
         requests = []
         for req in reps:
             item = self.redactor.request(req)
@@ -246,14 +253,18 @@ class Engine:
                                 for p in self.policies if p["request_id"] in ids],
                    "previous_results": previous}
         # Bound input while preserving syntactically complete JSON.
-        while len(json.dumps(context, ensure_ascii=False)) > 40000:
+        while len(json.dumps(context, ensure_ascii=False)) > self.config.data["max_context_chars"]:
             if context["previous_results"]:
                 context["previous_results"].pop(0)
+            elif any(r["captured_responses"] for r in context["requests"]):
+                next(r for r in reversed(context["requests"]) if r["captured_responses"])["captured_responses"].pop()
             elif len(context["requests"]) > 1:
                 context["requests"].pop()
                 context["sampled_requests"] = len(context["requests"])
+                ids = {r["id"] for r in context["requests"]}
+                context["policies"] = [p for p in context["policies"] if p["request_id"] in ids]
             else:
-                break
+                raise ValueError("Model context exceeds max_context_chars; reduce capture body or configured session/policy size")
         return context
 
     def run(self):
@@ -261,10 +272,22 @@ class Engine:
         for req in self.requests.values():
             groups[req.group].append(req)
         ordered = sorted(groups.values(), key=lambda g: (-max(r.priority for r in g), g[0].group))
+        def checkpoint(group):
+            return "group-" + digest([self.context_key, type(self.planner).__name__,
+                                       sorted(r.id for r in group), [self.store.captures(r.id) for r in group]])
+        pending = []
+        for group in ordered:
+            row = self.store.db.execute("SELECT value FROM settings WHERE name=?", (checkpoint(group),)).fetchone()
+            if not row or time.time() - float(row[0]) >= self.config.data["evidence_ttl_seconds"]:
+                pending.append(group)
+        processed = len(ordered) - len(pending)
+        def complete(group):
+            self.store.db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (checkpoint(group), str(time.time())))
+            self.store.db.commit()
         try:
-            for group in ordered[:self.config.data["max_groups"]]:
+            for group in pending[:self.config.data["max_groups"]]:
                 print(f"[+] 기능 {group[0].group}: 요청 {len(group)}개", flush=True)
-                for req in group[:self.config.data["samples_per_group"]]:
+                for req in self.representatives(group):
                     self.observe(req, req.session, "baseline")
                 # Policy-defined auth tests work even without an LLM.
                 for policy in self.policies:
@@ -276,10 +299,12 @@ class Engine:
                                     hypothesis="설정된 비공개 객체의 계정별 접근 검증", expected_evidence="소유자·반복 요청·음성 대조 확인")
                         self.execute(plan)
                 if not self.planner:
+                    complete(group)
+                    processed += 1
                     continue
                 for round_number in range(self.config.data["rounds"]):
                     context = self.context(group)
-                    key = digest([self.context_key, group[0].group, round_number,
+                    key = digest([self.context_key, type(self.planner).__name__, group[0].group, round_number,
                                   sorted(r.id for r in group),
                                   [self.store.captures(r.id) for r in group]])
                     cached = self.store.get("calls", key)
@@ -287,15 +312,23 @@ class Engine:
                             time.time() - cached.get("recorded_at", 0) < self.config.data["evidence_ttl_seconds"]):
                         answer = cached["answer"]
                     else:
+                        if self.store.count("model_usage_unknown_calls") > self.store.count("model_usage_acknowledged_calls"):
+                            raise BudgetExceeded("Model usage is unknown for a previous call; inspect usage before further model calls")
+                        if self.store.count("model_tokens") >= self.config.data["max_model_tokens"]:
+                            raise BudgetExceeded("Model token soft budget exhausted; one call can exceed this limit")
                         if not self.store.reserve("ai_calls", self.config.data["max_ai_calls"]):
                             raise BudgetExceeded("AI call budget exhausted")
-                        self.store.call(key, "started", {"status": "started", "group": group[0].group})
+                        self.store.call(key, "started", {"status": "started", "group": group[0].group,
+                                                          "is_live": getattr(self.planner, "is_live", False)})
                         try:
                             answer, usage = self.planner.plan(context)
                         except Exception as exc:
+                            if getattr(self.planner, "is_live", False):
+                                self.store.increment("model_usage_unknown_calls", 1)
                             self.store.call(key, "failed", {"status": "failed", "group": group[0].group,
                                                            "error": self.redactor.text(str(exc))[:500]})
                             raise
+                        self.store.record_model_usage(usage, getattr(self.planner, "is_live", False))
                         valid_plans = []
                         for candidate in answer["plans"][:self.config.data["max_plans_per_group"]]:
                             try:
@@ -308,7 +341,9 @@ class Engine:
                             valid_plans.append(self.safe_plan(candidate))
                         answer = {"notes": self.redactor.text(answer["notes"])[:4000], "plans": valid_plans}
                         self.store.call(key, "completed", {"status": "completed", "group": group[0].group,
-                                                          "answer": answer, "usage": usage, "recorded_at": time.time()})
+                                                          "answer": answer, "usage": usage,
+                                                          "reasoning_effort": self.planner.effort(context) if hasattr(self.planner, "effort") else "demo",
+                                                          "recorded_at": time.time()})
                     if not answer["plans"]:
                         break
                     for plan in answer["plans"][:self.config.data["max_plans_per_group"]]:
@@ -320,6 +355,21 @@ class Engine:
                         except ValueError as exc:
                             self.store.put("results", digest([key, plan, "rejected"]),
                                            {"kind": "rejected_plan", "state": "rejected", "plan": self.redactor.obj(plan), "reason": str(exc)})
+                complete(group)
+                processed += 1
         except BudgetExceeded as exc:
-            return {"stopped": True, "reason": str(exc)}
-        return {"stopped": False, "reason": "처리 완료; 미확인 항목은 안전 판정이 아님"}
+            status = {"stopped": True, "reason": str(exc), "groups_processed": processed,
+                      "groups_total": len(ordered), "groups_remaining": len(ordered) - processed}
+        except Exception:
+            status = {"stopped": True, "reason": "실행 오류; 진행 상태 보존", "groups_processed": processed,
+                      "groups_total": len(ordered), "groups_remaining": len(ordered) - processed}
+            self.store.db.execute("INSERT OR REPLACE INTO settings VALUES ('last_run',?)", (json.dumps(status),))
+            self.store.db.commit()
+            raise
+        else:
+            remaining = len(ordered) - processed
+            status = {"stopped": bool(remaining), "reason": "Group limit reached" if remaining else "처리 완료; 미확인 항목은 안전 판정이 아님",
+                      "groups_processed": processed, "groups_total": len(ordered), "groups_remaining": remaining}
+        self.store.db.execute("INSERT OR REPLACE INTO settings VALUES ('last_run',?)", (json.dumps(status),))
+        self.store.db.commit()
+        return status

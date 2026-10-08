@@ -24,7 +24,9 @@ URL TXT / httpx JSONL / HAR → 기능별 묶음 → Plus 로그인 Codex CLI
 - 권한 테스트는 계정 신원 확인, 소유자/다른 계정의 각 2회 요청, 음성 대조 2회로 후보를 판단합니다.
 - 무해한 입력 반사와 테스트/대조 값에 따른 반복 응답 차이를 검사합니다.
 - 업로드·SSRF·브라우저 XSS·다단계 업무 로직은 현재 실행기에서 **수동 검증 계획**으로 기록합니다.
-- SQLite에 진행 상태와 예산을 저장해 같은 작업 폴더에서 재개합니다.
+- SQLite에 진행 상태와 예산을 저장해 같은 작업 폴더에서 남은 그룹을 재개합니다.
+- 입력 크기와 누적 모델 토큰을 제한하고 사용량·미확인 호출·남은 그룹을 보고서에 표시합니다.
+- 기본 추론은 `low`입니다. `adaptive_reasoning: true`일 때 권한 후보·일관된 응답 차이만 `medium`으로 검토합니다.
 - Gemini의 URL 기반 확률 순위 기능은 기본 비활성화했습니다. 필요할 때 `ENABLE_LEGACY_GEMINI=1`과 기존 API 키로 사용할 수 있습니다.
 
 ## 시작하기
@@ -73,6 +75,19 @@ python -m bounty_assist run --config config.local.json
 
 상세 설정과 판정 조건은 [한국어 사용 설명서](docs/bounty_assist_ko.md)를 참고하세요.
 
+## Windows 실행
+
+PowerShell에서 저장소 폴더로 이동한 뒤 실행합니다. Python 3.10 이상과 Node.js LTS가 필요합니다.
+
+```powershell
+# 공식 CLI 설치·본인 PC 로그인·대상 요청 없이 실제 GPT 호출 확인
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows_start.ps1 -Mode Check -InstallCodex -Login
+# 실제 GPT로 로컬 테스트 서버의 반복 진단 검증
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows_start.ps1 -Mode LiveLab
+```
+
+`ExecutionPolicy Bypass`는 해당 PowerShell 프로세스에만 적용되며 시스템 정책을 변경하지 않습니다. 모의 데모는 `-Mode Demo`입니다. 실제 대상 설정을 완료한 다음 `-Mode Scan -Config config.local.json -Urls urls.txt`로 실행합니다. 쿠키 환경 변수는 해당 PowerShell 창에 설정하세요. 상세한 준비와 오류 대응은 [Windows 설명서](docs/windows_ko.md)를 참고하세요.
+
 ## 테스트와 로컬 데모
 
 ```bash
@@ -88,7 +103,7 @@ python examples/demo_bounty.py
 |---|---|
 | URL TXT / httpx JSONL / HAR 가져오기 | 구현 |
 | 기능별 표본 분석과 모든 원본 요청 보존 | 구현 |
-| 공식 Codex CLI + Plus 구독 인증 연결 | 구현, 이 변경 환경에서 실제 사용자 로그인 검증은 하지 않음 |
+| 공식 Codex CLI + Plus 구독 인증 연결 | 구현; 현재 작업 환경의 실제 모델 호출은 타임아웃으로 미검증 |
 | 계정별 읽기 권한·정책 기반 객체 접근 검증 | 구현 |
 | query / JSON / form / 단일 path 값 변경 | 구현 |
 | 반복 응답 차이·무해한 입력 반사 | 구현, 취약점 확정 아님 |

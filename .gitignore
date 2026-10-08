@@ -6,3 +6,4 @@ config.local.json
 inventory.json
 reports/
 demo-output/
+live-output/

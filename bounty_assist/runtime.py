@@ -18,8 +18,10 @@ DEFAULTS = {"origins": [], "allow_private": False, "allowed_methods": ["GET", "H
             "rounds": 2, "max_plans_per_group": 3, "samples_per_group": 5,
             "max_body_bytes": 65536, "request_timeout": 10, "requests_per_second": 1,
             "evidence_ttl_seconds": 900,
+            "max_model_tokens": 80000, "max_context_chars": 24000,
             "sessions": {"anonymous": {"origins": [], "headers_env": {}}}, "policies": [],
-            "codex": {"executable": "codex", "model": "", "reasoning_effort": "low", "timeout": 180}}
+            "codex": {"executable": "codex", "model": "", "reasoning_effort": "low", "timeout": 180,
+                      "adaptive_reasoning": False, "review_effort": "medium"}}
 
 
 class BudgetExceeded(RuntimeError):
@@ -33,7 +35,7 @@ class Config:
         self.origins = {origin(x) for x in self.data["origins"]}
         if not self.origins:
             raise ValueError("origins must contain explicit authorized HTTP origins")
-        for name in ("max_requests", "max_ai_calls", "max_groups", "rounds", "max_plans_per_group", "samples_per_group", "max_body_bytes", "evidence_ttl_seconds"):
+        for name in ("max_requests", "max_ai_calls", "max_groups", "rounds", "max_plans_per_group", "samples_per_group", "max_body_bytes", "evidence_ttl_seconds", "max_model_tokens", "max_context_chars"):
             value = self.data[name]
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -68,6 +70,12 @@ class Config:
         self.codex = {**DEFAULTS["codex"], **self.data.get("codex", {})}
         if self.codex["reasoning_effort"] not in ("low", "medium", "high"):
             raise ValueError("Unsupported reasoning effort")
+        if type(self.codex["adaptive_reasoning"]) is not bool or self.codex["review_effort"] not in ("medium", "high"):
+            raise ValueError("Unsupported adaptive reasoning configuration")
+        if type(self.codex["timeout"]) not in (int, float) or not 1 <= self.codex["timeout"] <= 600:
+            raise ValueError("Codex timeout must be between 1 and 600 seconds")
+        if not 4000 <= self.data["max_context_chars"] <= 100000:
+            raise ValueError("max_context_chars must be between 4000 and 100000")
 
     def secret_values(self):
         values = []

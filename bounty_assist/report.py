@@ -19,10 +19,15 @@ def export(engine, path):
                "plans": engine.store.all("plans"), "calls": engine.store.all("calls"),
                "coverage": {"imported_requests": len(requests), "observations": sum(r.get("kind") == "observation" for r in results),
                             "http_requests": engine.store.count("http_requests"), "ai_calls": engine.store.count("ai_calls"),
+                            "model_tokens": engine.store.count("model_tokens"),
+                            "max_model_tokens": engine.config.data["max_model_tokens"],
+                            "model_usage_unknown_calls": engine.store.count("model_usage_unknown_calls"),
                             "max_requests": engine.config.data["max_requests"], "max_ai_calls": engine.config.data["max_ai_calls"]}}
     payload["demo"] = any("Offline demo" in c.get("answer", {}).get("notes", "") for c in payload["calls"])
-    payload["model_usage"] = dict(Counter({k: sum(c.get("usage", {}).get(k, 0) for c in payload["calls"])
-                                          for k in ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_output_tokens")}))
+    last_run = engine.store.db.execute("SELECT value FROM settings WHERE name='last_run'").fetchone()
+    payload["last_run"] = json.loads(last_run[0]) if last_run else None
+    payload["model_usage"] = {k: engine.store.count("model_" + k)
+                              for k in ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_output_tokens")}
     private_json(path, payload)
     return payload
 
@@ -71,8 +76,12 @@ th,td{text-align:left;padding:10px;border-bottom:1px solid #e5e9f2;vertical-alig
 <div class="table-wrap"><table><thead><tr><th>요청 ID</th><th>메서드</th><th>계정</th><th>소유자</th><th>URL</th></tr></thead><tbody>INVENTORY</tbody></table></div>
 <script>const search=document.getElementById('search'),filter=document.getElementById('filter');function update(){document.querySelectorAll('.finding').forEach(el=>{el.hidden=!(el.textContent.toLowerCase().includes(search.value.toLowerCase())&&(!filter.value||el.dataset.state===filter.value))})}search.addEventListener('input',update);filter.addEventListener('change',update);</script></main></html>'''
     mode = ' · DEMO (실제 GPT 호출 없음)' if payload["demo"] else ''
+    if payload["last_run"]:
+        last = payload["last_run"]
+        mode += f' · 그룹 {last["groups_processed"]}/{last["groups_total"]} · 남은 그룹 {last["groups_remaining"]}'
     replacements = {"COVERAGE": f'수집 요청 {coverage["imported_requests"]} · HTTP {coverage["http_requests"]}/{coverage["max_requests"]} · AI {coverage["ai_calls"]}/{coverage["max_ai_calls"]}{mode}',
-                    "CARDS": cards, "OPTIONS": "".join(f'<option value="{esc(s)}">{esc(LABELS.get(s,s))}</option>' for s in sorted(counts)),
+                    "CARDS": cards + f'<div class="card"><strong>{coverage["model_tokens"]}</strong><span>누적 모델 토큰 · 기준 {coverage["max_model_tokens"]}</span></div>' + f'<p class="note">토큰 기준은 호출 후 확인하는 중단 기준입니다. 사용량 미확인 호출: {coverage["model_usage_unknown_calls"]}. Plus 잔여 한도를 뜻하지 않습니다.</p>',
+                    "OPTIONS": "".join(f'<option value="{esc(s)}">{esc(LABELS.get(s,s))}</option>' for s in sorted(counts)),
                     "FINDINGS": "".join(rows) or '<p class="empty">검증 결과가 없습니다. 요청 목록을 가져온 뒤 run 명령을 실행하세요.</p>',
                     "INVENTORY": inventory_rows}
     # Replace tokens in the template only; never process tokens inside untrusted text.

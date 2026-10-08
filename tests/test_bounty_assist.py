@@ -227,7 +227,8 @@ class EngineTests(unittest.TestCase):
             self.assertNotIn(malicious["hypothesis"], text)
             self.assertIn("&lt;script&gt;", text)
             self.assertNotIn("sid=lab-user-a", text)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_unknown_request_plan_is_rejected(self):
         with lab() as (base, server):
